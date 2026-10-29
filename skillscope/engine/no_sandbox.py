@@ -491,6 +491,23 @@ def harness_solver(
             # and the next case must not inherit that.
             normalize = harness.normalizer()
 
+            if room_names:
+                # A harness that does not announce its skills at session start
+                # can still be asked what a session here would load, once per
+                # case and without a model call. Off the event loop: it blocks.
+                listed = await asyncio.to_thread(harness.room, workspace, env)
+                if listed is not None:
+                    seen = {name.lower() for name in listed}
+                    known = {name.lower() for name in room_names}
+                    state.store.set(
+                        VISIBLE_SKILLS_KEY,
+                        [name for name in room_names if name.lower() in seen],
+                    )
+                    state.store.set(
+                        EXTRA_SKILLS_KEY,
+                        [name for name in listed if name.lower() not in known],
+                    )
+
             events: list[dict] = []
             if stop_when_factory is None:
                 result = await sandbox_subprocess(

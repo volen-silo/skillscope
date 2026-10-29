@@ -40,8 +40,9 @@ engines. `--harness` chooses one; see [usage.md](usage.md#which-engine-grades-a-
 
 Things to know about `copilot` before reading its numbers:
 
-* **Its room always contains built-in skills.** Copilot ships a few of its own,
-  so they are present beside the skills a run stages and can win a case.
+* **Its room always contains built-in skills.** Copilot ships a few of its own, so
+  they are present beside the skills a run stages and can win a case. They are not
+  reported as extras, since they are the harness and not a leftover on the runner.
 * **It reports its answer separately from its closing event.** The harness
   remembers the last assistant message and attaches it to the end of the run.
 * **It reports tokens once, at the end,** and no dollar cost, so a spend cap in
@@ -71,6 +72,8 @@ A harness is a subclass of `skillscope.harness.Harness`, registered in
 | `supports_sandbox` | Whether a container leg exists (`--engine sandbox`). |
 | `cost_flags(max_budget_usd)` | The CLI's own spend controls for a case. Empty when it has none, which the report then says rather than implying a cap. |
 | `version()` | What `<binary> --version` prints, for the report. |
+| `complete(prompt, model)` | Ask the model one question with no tools and return its answer. The judge uses it for a harness with no API of its own to call. The default runs the harness's own command with `RunSpec.tool_free` set, so `command` must grant nothing in that case, and reads the answer through `normalizer()`. |
+| `room(workspace, env)` | The skills a session started in `workspace` would load, for a harness that does not announce them at session start; `None` if it cannot say. It must not cost a model call. |
 | `preflight(model)` | One trivial prompt through the harness's own command, to prove before any case runs that the credential, the model name and the network work. The default is enough for most harnesses. |
 | `command(spec)` | The argv that runs one case, headless, streaming JSON events. The executable is named (`binary`), never an absolute path on this machine, so the same command can be started on the host or in a container. |
 | `env(spec)` | What the harness sets in the process's environment, and nothing else: its own settings, and whatever points it at `spec.config_dir` so the runner's own settings and skills stay out of the session. Not the runner's environment (`PATH`, `HOME`, every key on the machine), which a container must not inherit. Whoever starts the process puts this on top of the environment it has. |
@@ -130,19 +133,15 @@ from one is not comparable with a score from another.
 ## What is not yet behind the contract
 
 The contract covers staging, the command, the environment, the events, the model,
-the credential check, the spend controls and the preflight. These still assume
-Claude Code, and a harness other than it cannot yet use them:
+the credential check, the spend controls, the preflight, the judge and the room
+check. Two things still assume Claude Code:
 
-* **the judge** that grades `behavioral` expectations goes through an Anthropic
-  model whatever agent produced the run, so `behavioral` is refused on any other
-  harness;
-* **the room check**: Claude Code reports at session start which skills it
-  loaded, and the engine compares that with what was staged. A harness with no
-  such event leaves the check not run;
+* **Claude Code's own judge** is its inspect model, not `complete`; its command
+  refuses `tool_free` rather than run a question with permissions skipped;
 * **the sandbox leg**: `--engine claude-code` still runs Claude Code through
   `inspect_swe`, with its own command line, environment, skill staging and event
   handling. It should start the harness's `command(spec)` in the container, so that
   each agent is defined once. Until it does, a harness other than Claude Code has no
   sandboxed leg;
-* **`.claude/skills`** as the path routing treats as a skills inspection, rather
+* **`.claude/skills`** is the path routing treats as a skills inspection, rather
   than a harness's own `skills_dir`.

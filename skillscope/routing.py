@@ -511,6 +511,25 @@ def summarize(outcomes: list[Outcome], skills: list[str], meta: dict) -> dict:
     }
 
 
+def _other_harness(summary: dict) -> bool:
+    """Whether the run's agent was something other than Claude Code."""
+    harness = (summary.get("meta") or {}).get("harness")
+    return bool(harness) and harness != "claude-code"
+
+
+def _isolate_advice(summary: dict) -> str:
+    """How to keep the runner's own skills out of the room, for this harness."""
+    if _other_harness(summary):
+        return (
+            "Set the harness's credential in the environment so the run can "
+            "use an isolated config dir, or remove them from the runner."
+        )
+    return (
+        "Set `ANTHROPIC_API_KEY` so the run can use an isolated "
+        "config dir, or remove them from the runner."
+    )
+
+
 def render_markdown(summary: dict) -> str:
     totals = summary["totals"]
     verdicts = summary["verdicts"]
@@ -682,21 +701,30 @@ def render_markdown(summary: dict) -> str:
             f"registered for these sessions ({shown}). They come from the "
             f"runner's own config (usually `~/.claude/skills`) and compete for "
             f"every prompt, so the room measured here is not the one that was "
-            f"asked for. Set `ANTHROPIC_API_KEY` so the run can use an isolated "
-            f"config dir, or remove them from the runner.",
+            f"asked for. {_isolate_advice(summary)}",
         ]
     if not summary.get("room_checked_cases"):
         # Said once, and only when no case could be checked. Both warnings
         # above are silent on this leg whatever the room actually held, and a
         # silent warning reads as a passed check -- which is how a contaminated
         # runner would go unreported rather than unreportable.
-        lines += [
-            "",
-            "> **Note:** the room was not verified. The check reads the skills "
-            "the CLI announces at session init, which only "
-            "`claude-code-no-sandbox` can see -- `claude-code` drives the CLI "
-            "through `inspect_swe`, which does not surface that event. So the "
-            "two warnings above cannot fire on this leg: absence of them is "
-            "not evidence the agent saw the room this report describes.",
-        ]
+        if _other_harness(summary):
+            lines += [
+                "",
+                "> **Note:** the room was not verified. The check asks the "
+                "harness which skills a session would load, and this run's "
+                "harness could not say. So the two warnings above cannot fire: "
+                "absence of them is not evidence the agent saw the room this "
+                "report describes.",
+            ]
+        else:
+            lines += [
+                "",
+                "> **Note:** the room was not verified. The check reads the skills "
+                "the CLI announces at session init, which only "
+                "`claude-code-no-sandbox` can see -- `claude-code` drives the CLI "
+                "through `inspect_swe`, which does not surface that event. So the "
+                "two warnings above cannot fire on this leg: absence of them is "
+                "not evidence the agent saw the room this report describes.",
+            ]
     return "\n".join(lines) + "\n"

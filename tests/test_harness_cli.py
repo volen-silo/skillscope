@@ -35,8 +35,25 @@ RECORDING = Path(__file__).parent / "fixtures" / "harness" / "copilot" / "trigge
 STUB = """
 import json, os, sys, time
 
+# The real CLI prints UTF-8. A Python child on Windows defaults to the legacy code
+# page, which turns the recording's non-ASCII text into bytes no UTF-8 reader accepts.
+sys.stdout.reconfigure(encoding="utf-8")
+
 if "--version" in sys.argv:
     print("GitHub Copilot CLI 9.9.9.")
+    sys.exit(0)
+
+if sys.argv[1:3] == ["skill", "list"]:
+    # Asked once per case for the room check. Recorded apart from case starts.
+    name = "room-%020d-%d.json" % (time.time_ns(), os.getpid())
+    with open(os.path.join(os.environ["STUB_RECORD"], name), "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"cwd": os.getcwd(), "home": os.environ.get("COPILOT_HOME")}))
+    if os.environ.get("STUB_SKILLS_FAIL"):
+        sys.exit(1)
+    print(os.environ.get("STUB_SKILLS") or json.dumps([
+        {"name": "rocm-doctor", "source": "project"},
+        {"name": "customize-cloud-agent", "source": "builtin"},
+    ]))
     sys.exit(0)
 
 prompt = sys.stdin.read()
@@ -55,6 +72,16 @@ with open(os.path.join(os.environ["STUB_RECORD"], name), "w", encoding="utf-8") 
     }))
 
 if prompt == "Reply with the single word: ok":
+    print(json.dumps({"type": "result", "exitCode": 0}), flush=True)
+    sys.exit(0)
+
+if prompt.startswith("You are grading whether a coding agent"):
+    # The judge: one question, no tools. Answer as told.
+    if os.environ.get("STUB_JUDGE_FAIL"):
+        sys.stderr.write(os.environ["STUB_JUDGE_FAIL"])
+        sys.exit(1)
+    answer = os.environ.get("STUB_VERDICT") or json.dumps({"pass": True, "reason": "ok"})
+    print(json.dumps({"type": "assistant.message", "data": {"content": answer}}), flush=True)
     print(json.dumps({"type": "result", "exitCode": 0}), flush=True)
     sys.exit(0)
 
@@ -123,6 +150,14 @@ class _Copilot(unittest.TestCase):
         return [
             json.loads(path.read_text(encoding="utf-8"))
             for path in sorted(self.record.glob("*.json"))
+            if not path.name.startswith("room-")
+        ]
+
+    def rooms(self) -> list[dict]:
+        """How each `skill list` the engine asked for was run."""
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(self.record.glob("room-*.json"))
         ]
 
     def meta(self) -> dict:
@@ -261,19 +296,181 @@ class TestWhatIsRefusedBeforeAnythingRuns(_Copilot):
         message = self.refused("--harness", "copilot", "--engine", "sandbox")
         self.assertIn("no sandboxed leg", message)
 
-    def test_behavioral_while_its_judge_is_not_available(self) -> None:
-        args = cli.build_parser().parse_args(["behavioral", "--harness", "copilot"])
-        with self.assertRaises(SystemExit) as raised:
-            cli._prepare_graded_run(args)
-        self.assertIn("cannot run behavioral yet", str(raised.exception))
-        self.assertEqual(self.starts(), [])
-
     def test_a_preflight_that_fails_says_why(self) -> None:
         with mock.patch.object(harness.get("copilot"), "preflight",
                                lambda model, timeout=60.0: (False, "Bad credentials")):
             message = self.refused("--harness", "copilot")
         self.assertIn("copilot not reachable", message)
         self.assertIn("Bad credentials", message)
+
+
+class TestTheRoomOnCopilot(_Copilot):
+    """Copilot does not announce its skills, so the engine asks for them."""
+
+    def markdown(self) -> str:
+        return self.summary.read_text(encoding="utf-8")
+
+    def run_routing(self, *argv: str, **kwargs) -> int:
+        self.summary = self.report.parent / "summary.md"
+        return super().run_routing("--summary", str(self.summary), *argv, **kwargs)
+
+    def cases(self) -> list[dict]:
+        return json.loads(self.report.read_text(encoding="utf-8"))["cases"]
+
+    def test_the_cli_is_asked_once_per_case_in_the_cases_own_isolation(self) -> None:
+        self.run_routing("--harness", "copilot", "--skip-preflight")
+        rooms = self.rooms()
+        self.assertEqual(len(rooms), 2)
+        self.assertTrue(all(room["home"] for room in rooms))
+
+    def test_the_staged_skill_is_seen_and_the_clis_own_are_not_extras(self) -> None:
+        self.run_routing("--harness", "copilot", "--skip-preflight")
+        for case in self.cases():
+            self.assertEqual(case["visible_skills"], [SKILL])
+            self.assertEqual(case["extra_skills"], [])
+        self.assertNotIn("room was not verified", self.markdown())
+
+    def test_a_skill_nobody_staged_is_named_as_an_extra(self) -> None:
+        listed = json.dumps([
+            {"name": SKILL, "source": "project"},
+            {"name": "a-stray-skill", "source": "personal"},
+        ])
+        with mock.patch.dict(os.environ, {"STUB_SKILLS": listed}):
+            self.run_routing("--harness", "copilot", "--skip-preflight")
+        self.assertEqual(self.cases()[0]["extra_skills"], ["a-stray-skill"])
+        warning = self.markdown()
+        self.assertIn("a-stray-skill", warning)
+        # The remedy must not tell a Copilot user to set a Claude credential.
+        self.assertNotIn("ANTHROPIC_API_KEY", warning)
+        self.assertIn("harness's credential", warning)
+
+    def test_a_cli_that_cannot_say_leaves_the_room_unverified_and_says_so(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_SKILLS_FAIL": "1"}):
+            self.run_routing("--harness", "copilot", "--skip-preflight")
+        note = self.markdown()
+        self.assertIn("room was not verified", note)
+        self.assertIn("harness could not say", note)
+        self.assertNotIn("claude-code-no-sandbox", note)
+
+
+# One behavioral case that the recording satisfies: it ran `rocm --version`, and its
+# closing answer says it ran nothing. Judged expectations are answered by the stub.
+def behavioral_dataset() -> dict:
+    dataset = tier0_dataset(SKILL)
+    first = dataset["evaluations"][0]
+    first["logs_contain"] = ["rocm --version"]
+    first["expected_behavior"] = ["The agent checks whether the rocm CLI is present"]
+    first["unexpected_behavior"] = ["The agent changes anything on the machine"]
+    return dataset
+
+
+class TestABehavioralRunOnCopilot(unittest.TestCase):
+    """Its agent and its judge are both the harness's CLI: no model credential."""
+
+    def setUp(self) -> None:
+        self.repo = Repo(self)
+        self.repo.skill(SKILL, dataset=behavioral_dataset())
+        self.repo.activate()
+        self.repo.chdir()
+        stub_cli(self, "copilot", STUB)
+        scratch = Path(tempfile.mkdtemp(prefix="ss-behavioral-"))
+        self.addCleanup(shutil.rmtree, scratch, True)
+        self.record = scratch / "starts"
+        self.record.mkdir()
+        self.report = scratch / "report.json"
+        env = mock.patch.dict(
+            os.environ,
+            {
+                engine_sandbox.SANDBOX_ENV: "local",
+                "GH_TOKEN": "a-token-for-the-test",
+                "STUB_RECORD": str(self.record),
+                "STUB_REPLAY": str(RECORDING),
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        for variable in (
+            "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN", "CI", "GITHUB_ACTIONS", "SKILLSCOPE_HARNESS", "SKILLSCOPE_ENGINE",
+        ):
+            os.environ.pop(variable, None)
+        usage.reset()
+        self.addCleanup(usage.reset)
+
+    def run_behavioral(self, *argv: str) -> int:
+        args = cli.build_parser().parse_args(
+            ["behavioral", "--harness", "copilot", "--output", str(self.report),
+             "--skip-preflight", *argv]
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            return cli.cmd_behavioral(args)
+
+    def starts(self) -> list[dict]:
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(self.record.glob("*.json"))
+            if not path.name.startswith("room-")
+        ]
+
+    def checks(self) -> dict[str, dict]:
+        report = json.loads(self.report.read_text(encoding="utf-8"))
+        [case] = report["cases"]
+        return {check["kind"] + ":" + check["expectation"]: check for check in case["checks"]}
+
+    def test_it_runs_and_passes_with_no_anthropic_credential(self) -> None:
+        self.assertEqual(self.run_behavioral(), 0)
+        totals = json.loads(self.report.read_text(encoding="utf-8"))["totals"]
+        self.assertEqual((totals["cases"], totals["passed"], totals["errors"]), (1, 1, 0))
+
+    def test_every_kind_of_expectation_was_graded(self) -> None:
+        self.run_behavioral()
+        checks = self.checks()
+        self.assertEqual(len(checks), 3)
+        self.assertTrue(all(check["passed"] for check in checks.values()), checks)
+        judged = [c for c in checks.values() if c["kind"] != "logs_contain"]
+        self.assertEqual({c["detail"] for c in judged}, {"judge: ok"})
+
+    def test_the_judge_is_the_cli_asked_with_nothing_allowed(self) -> None:
+        self.run_behavioral()
+        starts = self.starts()
+        judging = [s for s in starts if s["prompt"].startswith("You are grading")]
+        running = [s for s in starts if not s["prompt"].startswith("You are grading")]
+        self.assertEqual(len(judging), 2)
+        self.assertEqual(len(running), 1)
+        for start in judging:
+            self.assertNotIn("--allow-all", start["argv"])
+            self.assertTrue([a for a in start["argv"] if a.startswith("--excluded-tools=")])
+            self.assertEqual(start["argv"][start["argv"].index("--model") + 1], "claude-sonnet-5.5")
+        self.assertIn("--allow-all", running[0]["argv"])
+
+    def test_the_judge_is_shown_what_the_agent_did(self) -> None:
+        self.run_behavioral()
+        question = next(s["prompt"] for s in self.starts() if s["prompt"].startswith("You are grading"))
+        self.assertIn("REQUIREMENT", question)
+        # The denied shell call in the recording is evidence of what it tried.
+        self.assertIn("rocm --version", question)
+
+    def test_a_negative_verdict_fails_that_expectation_and_the_case(self) -> None:
+        verdict = json.dumps({"pass": False, "reason": "it did not"})
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": verdict}):
+            code = self.run_behavioral()
+        self.assertEqual(code, 1)
+        self.assertIn("judge: it did not", {c["detail"] for c in self.checks().values()})
+
+    def test_a_judge_that_fails_is_reported_against_the_expectation(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_JUDGE_FAIL": "Error: Bad credentials"}):
+            code = self.run_behavioral()
+        self.assertEqual(code, 1)
+        details = [c["detail"] for c in self.checks().values()]
+        self.assertTrue(any(d.startswith("judge failed:") and "Bad credentials" in d for d in details))
+        # The deterministic expectation is still graded: one judge failing does
+        # not end the case.
+        self.assertTrue(self.checks()["logs_contain:rocm --version"]["passed"])
+
+    def test_the_report_names_the_harness(self) -> None:
+        self.run_behavioral()
+        meta = json.loads(self.report.read_text(encoding="utf-8"))["meta"]
+        self.assertEqual((meta["harness"], meta["engine"]), ("copilot", "host"))
 
 
 class TestResolvingTheLeg(unittest.TestCase):

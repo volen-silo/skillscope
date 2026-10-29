@@ -36,8 +36,11 @@ Other facts worth knowing before changing this:
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Callable
+import shutil
+import subprocess
+from typing import Callable, Mapping
 
 from .. import agent
 from .base import Harness, RunSpec
@@ -46,6 +49,11 @@ from .base import Harness, RunSpec
 # model costs fifteen, which matters for a run that makes dozens of them; and one
 # fixed model, so scores stay comparable from one run to the next.
 CI_MODEL = "claude-sonnet-5.5"
+
+# Every tool the CLI offers that could read or change the machine, for a run
+# that is only asking a question. Nothing is pre-approved either, so a tool that
+# is not on this list is denied in a non-interactive run.
+JUDGE_EXCLUDED_TOOLS = "shell,write,read,glob,grep,web_fetch,skill,task"
 
 # The generic aliases, in this CLI's names.
 ALIASES = {
@@ -121,13 +129,12 @@ class Copilot(Harness):
         # host engine's Claude Code, it runs unsandboxed. The built-in MCP
         # servers are off so a case is graded on the skill, not on a tool the
         # skill's author never had in mind.
-        cmd = [
-            self.binary,
-            "--output-format", "json",
-            "--allow-all",
-            "--no-ask-user",
-            "--disable-builtin-mcps",
-        ]
+        cmd = [self.binary, "--output-format", "json"]
+        if not spec.tool_free:
+            cmd.append("--allow-all")
+        cmd += ["--no-ask-user", "--disable-builtin-mcps"]
+        if spec.tool_free:
+            cmd.append(f"--excluded-tools={JUDGE_EXCLUDED_TOOLS}")
         if spec.model:
             cmd += ["--model", spec.model]
         if spec.effort:
@@ -144,6 +151,27 @@ class Copilot(Harness):
         if spec.config_dir is not None:
             env["COPILOT_HOME"] = spec.config_dir
         return env
+
+    def room(self, workspace: str, env: Mapping[str, str]) -> list[str] | None:
+        # `skill list --json` reports what a session started here would load,
+        # without a model call. Built-in skills ship with the CLI and are in
+        # every session, so they are not part of what was staged.
+        try:
+            proc = subprocess.run(
+                [shutil.which(self.binary), "skill", "list", "--json"],
+                cwd=workspace, env=dict(env), capture_output=True, text=True,
+                encoding="utf-8", timeout=60,
+            )
+            listed = json.loads(proc.stdout or "")
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            return None
+        if proc.returncode != 0 or not isinstance(listed, list):
+            return None
+        return [
+            str(entry["name"])
+            for entry in listed
+            if isinstance(entry, dict) and entry.get("name") and entry.get("source") != "builtin"
+        ]
 
     def normalizer(self) -> Callable[[dict], list[dict]]:
         # What the closing event needs and does not carry, remembered from the

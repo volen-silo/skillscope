@@ -59,9 +59,19 @@ def stub_cli(test: unittest.TestCase, name: str, script: str) -> None:
 STUB_COPILOT = """
 import json, os, sys
 
+# The real CLI prints UTF-8. A Python child on Windows defaults to the legacy code
+# page, which turns the recording's non-ASCII text into bytes no UTF-8 reader accepts.
+sys.stdout.reconfigure(encoding="utf-8")
+
 if "--version" in sys.argv:
     print("GitHub Copilot CLI 9.9.9.")
     print("Run 'copilot update' to check for updates.")
+    sys.exit(0)
+
+if sys.argv[1:3] == ["skill", "list"]:
+    if os.environ.get("STUB_SKILLS_FAIL"):
+        sys.exit(1)
+    print(os.environ.get("STUB_SKILLS", "[]"))
     sys.exit(0)
 
 stdin = sys.stdin.read()
@@ -81,6 +91,9 @@ if os.environ.get("STUB_FAIL"):
 if os.environ.get("STUB_HANG"):
     import time
     time.sleep(60)
+if os.environ.get("STUB_ANSWER"):
+    message = {"type": "assistant.message", "data": {"content": os.environ["STUB_ANSWER"]}}
+    print(json.dumps(message), flush=True)
 print(json.dumps({"type": "result", "exitCode": 0}), flush=True)
 """
 
@@ -186,6 +199,109 @@ class TestTheVersionTheReportNames(unittest.TestCase):
     def test_it_is_none_when_the_cli_is_not_installed(self) -> None:
         with mock.patch("shutil.which", lambda _: None):
             self.assertIsNone(harness.get("copilot").version())
+
+
+class TestAskingTheModelOneQuestion(unittest.TestCase):
+    """`complete`: what the judge uses when the harness has no API of its own."""
+
+    def setUp(self) -> None:
+        stub_cli(self, "copilot", STUB_COPILOT)
+        self.record = Path(tempfile.mkdtemp(prefix="ss-record-")) / "run.json"
+        self.addCleanup(shutil.rmtree, self.record.parent, True)
+        env = mock.patch.dict(
+            os.environ,
+            {"STUB_RECORD": str(self.record), "STUB_ANSWER": '{"pass": true, "reason": "ok"}'},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    def ask(self, **kwargs) -> str:
+        return harness.get("copilot").complete("Is it so?", "claude-sonnet-5.5", **kwargs)
+
+    def test_the_answer_is_what_the_cli_said(self) -> None:
+        self.assertEqual(self.ask(), '{"pass": true, "reason": "ok"}')
+
+    def test_the_question_goes_in_on_stdin(self) -> None:
+        self.ask()
+        self.assertEqual(json.loads(self.record.read_text(encoding="utf-8"))["stdin"], "Is it so?")
+
+    def test_nothing_is_allowed_and_every_tool_is_excluded(self) -> None:
+        self.ask()
+        argv = json.loads(self.record.read_text(encoding="utf-8"))["argv"]
+        # The agent's command grants every permission; the judge's must not.
+        self.assertNotIn("--allow-all", argv)
+        excluded = [a for a in argv if a.startswith("--excluded-tools=")]
+        self.assertEqual(len(excluded), 1)
+        for tool in ("shell", "write", "read", "web_fetch", "skill"):
+            self.assertIn(tool, excluded[0])
+
+    def test_it_runs_in_a_throwaway_home_and_workspace(self) -> None:
+        self.ask()
+        ran = json.loads(self.record.read_text(encoding="utf-8"))
+        self.assertTrue(ran["home"])
+        self.assertNotEqual(ran["cwd"], os.getcwd())
+
+    def test_a_refusal_carries_what_the_cli_said(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_FAIL": "Error: Bad credentials"}):
+            with self.assertRaises(harness.CompletionError) as raised:
+                self.ask()
+        self.assertIn("Bad credentials", str(raised.exception))
+
+    def test_a_cli_that_prints_no_answer_is_an_error_not_an_empty_one(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_ANSWER": ""}):
+            with self.assertRaises(harness.CompletionError) as raised:
+                self.ask()
+        self.assertIn("no answer", str(raised.exception))
+
+    def test_a_cli_that_never_answers_is_stopped(self) -> None:
+        import time
+
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"STUB_HANG": "1"}):
+            with self.assertRaises(harness.CompletionError) as raised:
+                self.ask(timeout=1)
+        self.assertIn("no answer within", str(raised.exception))
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_a_missing_cli_is_named(self) -> None:
+        with mock.patch("shutil.which", lambda _: None), self.assertRaises(harness.CompletionError):
+            self.ask()
+
+    def test_claude_code_cannot_be_asked_this_way(self) -> None:
+        # Its judge is its inspect model. Building the command with permissions
+        # skipped would run a question with the run of the machine.
+        claude = harness.get("claude-code")
+        spec = harness.RunSpec(workspace="ws", prompt="q", tool_free=True)
+        with self.assertRaises(NotImplementedError):
+            claude.command(spec)
+
+
+class TestWhichSkillsASessionWouldLoad(unittest.TestCase):
+    def setUp(self) -> None:
+        stub_cli(self, "copilot", STUB_COPILOT)
+
+    def room(self) -> list[str] | None:
+        return harness.get("copilot").room(tempfile.gettempdir(), dict(os.environ))
+
+    def test_what_the_cli_lists_minus_its_own_skills(self) -> None:
+        listed = json.dumps([
+            {"name": "rocm-doctor", "source": "project"},
+            {"name": "a-personal-skill", "source": "personal"},
+            {"name": "customize-cloud-agent", "source": "builtin"},
+        ])
+        with mock.patch.dict(os.environ, {"STUB_SKILLS": listed}):
+            self.assertEqual(self.room(), ["rocm-doctor", "a-personal-skill"])
+
+    def test_a_cli_that_cannot_say_leaves_the_room_unverified(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_SKILLS_FAIL": "1"}):
+            self.assertIsNone(self.room())
+
+    def test_output_that_is_not_a_list_leaves_the_room_unverified(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_SKILLS": '{"not": "a list"}'}):
+            self.assertIsNone(self.room())
+
+    def test_a_harness_that_announces_its_skills_itself_is_not_asked(self) -> None:
+        self.assertIsNone(harness.get("claude-code").room(tempfile.gettempdir(), {}))
 
 
 class TestThePreflight(unittest.TestCase):

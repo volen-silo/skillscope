@@ -274,12 +274,17 @@ harness, and CI holds each harness to one model. A report from one harness is it
 own result and is not comparable with another's. How a harness works, and how to
 add one, is in [harnesses.md](harnesses.md).
 
-**`copilot` today runs routing only.** It authenticates from
-`COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, needs no model credential,
-and in Actions needs `permissions: copilot-requests: write` in the calling
-workflow. `behavioral` is refused on it until the judge that grades its
-expectations is available through the harness. Its preflight sends one real
-prompt, which is billed like any other.
+**`copilot` needs no model credential.** It authenticates from
+`COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN`, and in Actions needs
+`permissions: copilot-requests: write` in the calling workflow. Both `routing` and
+`behavioral` run on it. The LLM judge that grades `expected_behavior` and
+`unexpected_behavior` is the same CLI, credential and model as the agent, asked one
+question with every tool excluded and nothing pre-approved; it sees text only, so an
+image artifact is named to it and not shown. Its preflight, and each judged
+expectation, send one real prompt, billed like any other. Copilot reports its skills
+through `copilot skill list --json` rather than at session start, so the room check
+runs once per case; the CLI's own built-in skills are present in every room and are
+not counted as extras, though they can still win a prompt.
 
 Where the agent runs is the axis worth choosing along: the host measures the machine as it is, with whatever else is installed
 on it, and the sandbox measures the skill alone. When the two disagree, the

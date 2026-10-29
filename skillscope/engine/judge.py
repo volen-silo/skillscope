@@ -21,6 +21,7 @@ cat" is answerable rather than inferred from a filename.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import PurePosixPath
 
 # Bounds on the evidence packet. A behavioral run can leave a model cache or a
@@ -209,14 +210,36 @@ async def artifacts(paths: list[str]) -> tuple[list[str], list[tuple[str, bytes]
     return described, images
 
 
+def harness_completer(harness, model: str | None):
+    """A `complete` for `grade` that asks the harness's own CLI.
+
+    For a harness whose agent is a subprocess with no API of its own to call: the
+    verdict comes from the same CLI, credential and model that produced the run,
+    asked one question with every tool denied. The CLI blocks, so it runs off the
+    event loop.
+    """
+
+    async def complete(prompt: str) -> str:
+        return await asyncio.to_thread(harness.complete, prompt, model)
+
+    return complete
+
+
 async def grade(
     statement: str,
     state,
     *,
     must_happen: bool,
     grader: str | None = None,
+    complete=None,
 ) -> tuple[bool, str]:
-    """Ask the grader whether one requirement was satisfied."""
+    """Ask the grader whether one requirement was satisfied.
+
+    `complete`, when given, is an async function from the question to the
+    answer's text, and replaces the inspect model: that is how a run whose agent
+    is not Claude Code is judged without an Anthropic credential. It sees text
+    only, so an image artifact is named in the question rather than attached.
+    """
     from inspect_ai.model import (
         ChatMessageUser,
         ContentImage,
@@ -272,12 +295,29 @@ async def grade(
         content.append(ContentText(text=f"--- {path} ---"))
         content.append(ContentImage(image=_data_uri(path, data)))
 
-    model = get_model(grader) if grader else get_model()
-    output = await model.generate([ChatMessageUser(content=content)])
+    if complete is not None:
+        question = content[0].text
+        if images:
+            names = ", ".join(path for path, _ in images)
+            question += (
+                f"\n\n[{len(images)} image artifact(s) were produced and cannot "
+                f"be shown to this judge: {names}]"
+            )
+        try:
+            completion = await complete(question)
+        except Exception as exc:  # the CLI failed or printed no answer
+            # Reported against this expectation, like a sandbox that could not be
+            # listed: the judge failing says nothing about whether the agent did
+            # what was asked, and one expectation should not end the whole run.
+            return False, f"judge failed: {exc}"
+    else:
+        model = get_model(grader) if grader else get_model()
+        output = await model.generate([ChatMessageUser(content=content)])
+        completion = output.completion or ""
 
-    parsed = parse_verdict(output.completion or "")
+    parsed = parse_verdict(completion)
     if parsed is None:
-        return False, f"judge gave no JSON verdict: {(output.completion or '')[:200]!r}"
+        return False, f"judge gave no JSON verdict: {completion[:200]!r}"
     satisfied, reason = parsed
     return satisfied, f"judge: {reason}"
 
